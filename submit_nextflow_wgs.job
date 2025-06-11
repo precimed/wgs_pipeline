@@ -1,0 +1,18 @@
+#!/usr/bin/bash
+
+# Job name:
+#SBATCH --job-name=WGS
+# Project:
+#SBATCH --account=p33_norment
+# Wall clock limit:
+#SBATCH --time=144:00:00
+#SBATCH --cpus-per-task=1
+# Max memory usage:
+#SBATCH --mem-per-cpu=16GB
+
+module purge
+module load R/4.1.2-foss-2021b
+source /ess/p33/cluster/users/mohammadzr/envs/pynext311/bin/activate
+export NXF_OFFLINE='TRUE'
+
+nextflow run qc_alignment_snpcall_v2.nf --out_merged ../v3/merged --out_fastp ../v3/processed_fastq --out_bwa ../v3/sams --out_bam ../v3/bams --out_deep ../v3/deep_vcf --out_filter ../v3/filtered_vcf --out_report ../v3/qc_reports --out_manta ../v3/manta_vcf --out_cnv ../v3/cnv_cns --out_report_deep ../v3/qc_reports/deepvariant

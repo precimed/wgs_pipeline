@@ -1,0 +1,365 @@
+nextflow.enable.dsl=1
+
+//Channel.fromFilePairs('/ess/p33/cluster/users/alexeas/wgs/from_marius/240425_LH00534.A.Project_Djurovic-DNA1-2024-03-01/fastq/*_S*_L*_R{1,2}_001.fastq.gz').set{fastq_files}
+//fastq_files.view()
+Channel.fromFilePairs('/ess/p33/cluster/users/mohammadzr/wgs/raw_fastq/*{_L001_R1*gz,_L002_R1*gz,_L003_R1*gz,_L004_R1*gz,_L001_R2*gz,_L002_R2*gz,_L003_R2*gz,_L004_R2*gz}',size:8).into{fastq_files;files}
+files.view()
+
+Channel.fromPath('/ess/p33/cluster/users/mohammadzr/wgs/reference/hg38-decoy.fa').into{reference_genome;reference_genome2}
+
+process lane_merge {
+
+executor='local'
+
+publishDir params.out_merged, mode:'copy'
+
+input:
+tuple val(sample_name), path(rl) from fastq_files
+
+output:
+tuple val(sample_name), path("${sample_name}_merged_R1.fastq.gz"), path("${sample_name}_merged_R2.fastq.gz") optional true into merge_out
+script:
+def (l1r1,l1r2,l2r1,l2r2,l3r1,l3r2,l4r1,l4r2) = rl
+"""
+cat ${l1r1} ${l2r1} ${l3r1} ${l4r1} > ${sample_name}_merged_R1.fastq.gz
+cat ${l1r2} ${l2r2} ${l3r2} ${l4r2} > ${sample_name}_merged_R2.fastq.gz
+
+### Check if Merging completed successfully
+if [ \$? -ne 0 ]; then
+   echo "Error: Merging failed for sample ${sample_name}"
+   exit 1
+fi
+"""
+}
+/*
+process format {
+
+executor='slurm'
+queueSize='200'
+jobName='qc'
+cpus='16'
+clusterOptions  "-A p33 -t 96:00:00 --mem-per-cpu 16000M"
+
+publishDir params.out_formatted, mode:'copy'
+
+input:
+tuple val(sample_name), path(read1), path(read2) from merge_out
+
+output:
+tuple val(sample_name), path("${sample_name}_formatted_R1.fastq.gz"), path("${sample_name}_formatted_R2.fastq.gz") optional true into format_out
+script:
+"""
+/ess/p33/cluster/users/mohammadzr/wgs/script/bbmap/reformat.sh -Xmx32g in1=${read1} in2=${read2} out1=${sample_name}_formatted_R1.fastq.gz out2=${sample_name}_formatted_R2.fastq.gz
+
+### Check if Merging completed successfully
+if [ \$? -ne 0 ]; then
+   echo "Error: Merging failed for sample ${sample_name}"
+   exit 1
+fi
+"""
+}
+*/
+process fastp {
+
+executor='slurm'
+queueSize='200'
+jobName='qc'
+cpus='16'
+clusterOptions  "-A p33 -t 96:00:00 --mem-per-cpu 16000M"
+
+publishDir params.out_fastp, mode:'copy'
+
+input:
+tuple val(sample_name), path(read1), path(read2) from merge_out
+
+output:
+tuple val(sample_name), path("${sample_name}_clean_R1.fastq.gz"), path("${sample_name}_clean_R2.fastq.gz"), path("${sample_name}_fastp_report.html") optional true into fastp_out
+script:
+"""
+singularity exec /ess/p33/cluster/users/mohammadzr/envs/sif_files/fastp_0.23.sif fastp -i ${read1} -I ${read2} -o ${sample_name}_clean_R1.fastq.gz -O ${sample_name}_clean_R2.fastq.gz --detect_adapter_for_pe --html ${sample_name}_fastp_report.html --thread 16
+
+### Check if Fastp completed successfully
+if [ \$? -ne 0 ]; then
+   echo "Error: Fastp failed for sample ${sample_name}"
+   exit 1
+fi
+"""
+}
+
+//reference_genome.combine(fastp_out).set{bwa_input}
+
+Channel.fromFilePairs('/ess/p33/cluster/users/mohammadzr/wgs/reference/hg38-decoy.{fa,fa.amb,fa.ann,fa.bwt,fa.pac,fa.sa}',size:6).set{ref_path}
+ref_path.combine(fastp_out).set{bwa_input}
+//bwa_input.view()
+
+process bwa_alignment {
+
+executor='slurm'
+queueSize='200'
+jobName='alignment'
+cpus='16'
+clusterOptions  "-A p33 -t 144:00:00 --mem-per-cpu 16000M"
+
+publishDir params.out_bwa, mode:'copy'
+
+input:
+tuple val(ref_name), path(ref_genome), val(sample_name), path(clean_read1), path(clean_read2), path(report) from bwa_input
+
+
+output:
+tuple val(sample_name), path("${sample_name}.sam") optional true into bwa_out
+
+script:
+def (ref_fasta,ambt,annt,bowt,pacs,saf) = ref_genome
+"""
+singularity exec /ess/p33/cluster/users/mohammadzr/envs/sif_files/bwa_0.7.17.sif bwa mem -t 16 -R "@RG\\tID:${sample_name}\\tSM:${sample_name}\\tPL:ILLUMINA" ${ref_fasta} ${clean_read1} ${clean_read2} > ${sample_name}.sam
+
+if [ \$? -ne 0 ]; then
+   echo "Error: BWA-MEM failed for sample ${sample_name}"
+   exit 1
+fi
+"""
+}
+
+process sam2bam {
+
+executor='slurm'
+queueSize='200'
+jobName='samtobam'
+cpus='16'
+clusterOptions  "-A p33 -t 144:00:00 --mem-per-cpu 16000M"
+
+publishDir params.out_bam, mode:'copy'
+
+input:
+tuple val(sample_name), path(sam_file) from bwa_out
+
+output:
+tuple val(sample_name), path("${sample_name}_sorted.bam"),path("${sample_name}_sorted.bai") optional true into bam_out
+
+script:
+"""
+singularity exec /ess/p33/cluster/users/mohammadzr/envs/sif_files/samtools_1.12.sif samtools view -@ 8 -bS ${sam_file} | singularity exec /ess/p33/cluster/users/mohammadzr/envs/sif_files/samtools_1.12.sif samtools sort -@ 8 -o ${sample_name}_sorted.bam
+
+singularity exec /ess/p33/cluster/users/mohammadzr/envs/sif_files/picard_2.23.8.sif java -jar /usr/picard/picard.jar MarkDuplicates I=${sample_name}_sorted.bam O=${sample_name}_dedup.bam M=${sample_name}_markduplicates_metrics.txt CREATE_INDEX=true VALIDATION_STRINGENCY=SILENT
+
+mv ${sample_name}_dedup.bam ${sample_name}_sorted.bam
+singularity exec /ess/p33/cluster/users/mohammadzr/envs/sif_files/samtools_1.12.sif samtools index ${sample_name}_sorted.bam ${sample_name}_sorted.bai
+
+if [ \$? -ne 0 ]; then
+    echo "Error: Picard MarkDuplicates failed for sample ${sample_name}"
+    exit 1
+fi
+"""
+}
+
+Channel.fromPath('/ess/p33/cluster/users/mohammadzr/wgs/reference/hg38-decoy.fa.fai').set{ref_index}
+reference_genome2.combine(ref_index).combine(bam_out).into{deep_in;manta_in;cnv_in}
+
+process deepvariant {
+beforeScript 'module purge'
+
+executor='slurm'
+queueSize='200'
+jobName='variant_call'
+cpus='16'
+clusterOptions  "-A p33 -t 144:00:00 --mem-per-cpu 16000M"
+
+publishDir params.out_deep, mode:'copy'
+
+input:
+tuple path(ref), path(ref_fai), val(sample_name), path(bam_file), path(bai_file) from deep_in
+
+output:
+tuple val(sample_name), path("${sample_name}_deepvariant.vcf.gz") optional true into deep_out,deep_out2
+
+script:
+"""
+singularity exec --home=pwd:/home --bind /ess/p33/cluster:/ess/p33/cluster /ess/p33/cluster/users/mohammadzr/envs/sif_files/deepvariant_1.5.sif /opt/deepvariant/bin/run_deepvariant --model_type=WGS --ref=${ref} --reads=${bam_file} --output_vcf=${sample_name}_deepvariant.vcf.gz --num_shards=8
+
+if [ \$? -ne 0 ]; then
+    echo "Error: DeepVariant failed for sample ${sample_name}"
+    exit 1
+fi
+
+"""
+}
+
+process variant_filter {
+
+executor='slurm'
+queueSize='200'
+jobName='filter'
+cpus='16'
+clusterOptions  "-A p33 -t 96:00:00 --mem-per-cpu 16000M"
+
+publishDir params.out_filter, mode:'copy'
+
+input:
+tuple val(sample_name), path(vcf_file) from deep_out
+
+output:
+tuple val(sample_name), path("${sample_name}_filtered.vcf.gz") optional true into filtered
+
+script:
+"""
+singularity exec /ess/p33/cluster/users/mohammadzr/envs/sif_files/bcftools_1.12.sif bcftools filter -i 'QUAL>30 && DP>10' ${vcf_file} -Oz -o ${sample_name}_filtered.vcf.gz
+
+singularity exec /ess/p33/cluster/users/mohammadzr/envs/sif_files/bcftools_1.12.sif tabix -p vcf ${sample_name}_filtered.vcf.gz
+
+if [ \$? -ne 0 ]; then
+    echo "Error: Variant filtering failed for sample ${sample_name}"
+    exit 1
+fi
+"""
+}
+//filtered.view()
+
+process qc_report {
+
+executor='slurm'
+queueSize='200'
+jobName='report'
+cpus='16'
+clusterOptions  "-A p33 -t 96:00:00 --mem-per-cpu 16000M"
+
+publishDir params.out_report, mode:'copy'
+
+input:
+tuple val(sample_name), path(vcf_file) from filtered
+
+output:
+tuple val(sample_name), path("${sample_name}_variant_stats.txt") optional true into reports
+
+script:
+"""
+singularity exec /ess/p33/cluster/users/mohammadzr/envs/sif_files/bcftools_1.12.sif bcftools stats ${vcf_file} > ${sample_name}_variant_stats.txt
+
+if [ \$? -ne 0 ]; then
+    echo "Error: QC report generation failed for sample ${sample_name}"
+    exit 1
+fi
+"""
+}
+
+process qc_report2 {
+
+executor='slurm'
+queueSize='200'
+jobName='report'
+cpus='16'
+clusterOptions  "-A p33 -t 96:00:00 --mem-per-cpu 16000M"
+
+publishDir params.out_report_deep, mode:'copy'
+
+input:
+tuple val(sample_name), path(vcf_file) from deep_out2
+
+output:
+tuple val(sample_name), path("${sample_name}_variant_stats.txt") optional true into reports2
+
+script:
+"""
+singularity exec /ess/p33/cluster/users/mohammadzr/envs/sif_files/bcftools_1.12.sif bcftools stats ${vcf_file} > ${sample_name}_variant_stats.txt
+
+if [ \$? -ne 0 ]; then
+    echo "Error: QC report generation failed for sample ${sample_name}"
+    exit 1
+fi
+"""
+}
+
+
+//reports.view()
+
+process qc_plot {
+
+executor='slurm'
+queueSize='200'
+jobName='report'
+cpus='16'
+clusterOptions  "-A p33 -t 96:00:00 --mem-per-cpu 16000M"
+
+publishDir params.out_report, mode:'copy'
+
+input:
+tuple val(sample_name), path(stat_file) from reports
+
+output:
+tuple val(sample_name), path("${sample_name}*pdf") optional true into plots
+
+script:
+"""
+Rscript /ess/p33/cluster/users/mohammadzr/wgs/script/bcf_stats_plot.R ${stat_file}
+
+if [ \$? -ne 0 ]; then
+    echo "Error: QC report plotting failed for sample ${sample_name}"
+    exit 1
+fi
+"""
+}
+
+process manta {
+beforeScript 'module purge'
+
+executor='slurm'
+queueSize='200'
+jobName='variant_call'
+cpus='16'
+clusterOptions  "-A p33 -t 144:00:00 --mem-per-cpu 16000M"
+
+publishDir params.out_manta, mode:'copy'
+
+input:
+tuple path(ref), path(ref_fai), val(sample_name), path(bam_file), path(bai_file) from manta_in
+
+output:
+tuple val(sample_name), path("${sample_name}_manta.vcf.gz*") optional true into manta_out
+
+script:
+"""
+singularity exec --home=pwd:/home --bind /ess/p33/cluster:/ess/p33/cluster /ess/p33/cluster/users/mohammadzr/envs/sif_files/manta_1.6.sif /usr/local/bin/configManta.py --bam ${bam_file} --referenceFasta ${ref} --runDir manta_run_${sample_name}
+
+singularity exec --home=pwd:/home --bind /ess/p33/cluster:/ess/p33/cluster /ess/p33/cluster/users/mohammadzr/envs/sif_files/manta_1.6.sif manta_run_${sample_name}/runWorkflow.py -m local -j 8
+
+mv manta_run_${sample_name}/results/variants/diploidSV.vcf.gz ${sample_name}_manta.vcf.gz
+mv manta_run_${sample_name}/results/variants/diploidSV.vcf.gz.tbi ${sample_name}_manta.vcf.gz.tbi
+
+
+if [ \$? -ne 0 ]; then
+    echo "Error: Manta failed for sample ${sample_name}"
+    exit 1
+fi
+"""
+}
+
+process cnvkit {
+beforeScript 'module purge'
+
+executor='slurm'
+queueSize='200'
+jobName='variant_call'
+cpus='16'
+clusterOptions  "-A p33 -t 144:00:00 --mem-per-cpu 16000M"
+
+publishDir params.out_cnv, mode:'copy'
+
+input:
+tuple path(ref), path(ref_fai), val(sample_name), path(bam_file), path(bai_file) from cnv_in
+
+output:
+tuple val(sample_name), path("${sample_name}*.cns") optional true into cnv_out
+
+script:
+"""
+singularity exec --home=pwd:/home --bind /ess/p33/cluster:/ess/p33/cluster /ess/p33/cluster/users/mohammadzr/envs/sif_files/cnvkit_0.9.sif /usr/local/bin/cnvkit.py batch ${bam_file} --fasta ${ref} --output-reference cnvkit_reference.cnn --output-dir cnvkit_output_${sample_name} -n -m wgs
+
+mv cnvkit_output_${sample_name}/${sample_name}*cns .
+
+
+if [ \$? -ne 0 ]; then
+    echo "Error: CNVKit failed for sample ${sample_name}"
+    exit 1
+fi
+"""
+}
