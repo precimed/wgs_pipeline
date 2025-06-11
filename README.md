@@ -6,3 +6,4 @@ The description of the pipeline is in the following document:
 
 https://docs.google.com/document/d/1f83QMAyq2GqquR3uZDFihZzXl3MZP13mQvcP8N1Uaes/edit?tab=t.0
 
+The nextflow script is produced based on the new_WGS_pileline_simplified.txt document
