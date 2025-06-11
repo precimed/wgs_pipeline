@@ -1,0 +1,335 @@
+#!/usr/bin/env nextflow
+
+nextflow.enable.dsl=2
+
+### Pipeline Parameters
+params {
+    ### Directory containing input FASTQ files
+    read_dir      = './data/fastq'
+
+    ### Reference genome file path
+    reference_genome = './ref/GRCh38.fa'
+
+    ### Output directory for all results
+    output_dir    = './results'
+
+    ### Optional: Sample name (if processing a single sample)
+    sample_name   = null
+}
+
+### Process Configurations with Container Images for Reproducibility
+process {
+    withName:process_fastp {
+        container = 'quay.io/biocontainers/fastp:0.23.4--h7d875b9_1'
+    }
+    withName:process_bwa {
+        container = 'biocontainers/bwa:v0.7.17_cv1'
+    }
+    withName:process_post_alignment {
+        container = 'broadinstitute/picard:2.23.8'
+    }
+    withName:process_deepvariant {
+        container = 'google/deepvariant:1.5.0'
+    }
+    withName:process_manta {
+        container = 'quay.io/biocontainers/manta:1.6.0--h84994c4_2'
+    }
+    withName:process_cnvkit {
+        container = 'etal/cnvkit:0.9.10'
+    }
+    withName:process_variant_filtering {
+        container = 'biocontainers/bcftools:v1.12_cv1'
+    }
+    withName:process_qc_reports {
+        container = 'rocker/tidyverse:4.1.0'
+    }
+}
+
+### Main Workflow Definition
+workflow {
+
+    ### Create output directories
+    Channel
+        .fromPath(params.output_dir)
+        .ifEmpty { exec "mkdir -p ${params.output_dir}" }
+
+    ### Input FASTQ files paired by sample
+    reads = Channel.fromFilePairs("${params.read_dir}/*_{R1,R2}.fastq.gz", flat: true)
+        .map { sample_name_from_files(it) }
+
+    ### Processing steps
+    reads
+        | process_fastp
+        | process_bwa
+        | process_post_alignment
+        | process_deepvariant
+        | process_variant_filtering
+        | process_qc_reports
+
+    ### Optional: Structural Variants and CNV analysis
+    reads
+        | process_fastp
+        | process_bwa
+        | process_post_alignment
+        | process_manta
+
+    reads
+        | process_fastp
+        | process_bwa
+        | process_post_alignment
+        | process_cnvkit
+}
+
+### Function to Extract Sample Name from FASTQ Files
+def sample_name_from_files(files) {
+    ### Extract sample name by removing suffix from filename
+    def fname = files[0].getName()
+    def sample_name = fname.replaceFirst(/_R1\.fastq\.gz$/, '')
+    return tuple(sample_name, files)
+}
+
+### Process: Quality Control and Trimming with Fastp
+process process_fastp {
+    tag { sample_name }
+
+    input:
+    tuple val(sample_name), path(reads)
+
+    output:
+    tuple val(sample_name), path("${sample_name}_clean_R1.fastq.gz"), path("${sample_name}_clean_R2.fastq.gz"),
+    path("${sample_name}_fastp_report.html")
+
+    ### Perform quality control and trimming using Fastp
+    script:
+    """
+    fastp \\
+        -i ${reads[0]} \\
+        -I ${reads[1]} \\
+        -o ${sample_name}_clean_R1.fastq.gz \\
+        -O ${sample_name}_clean_R2.fastq.gz \\
+        --detect_adapter_for_pe \\
+        --html ${sample_name}_fastp_report.html \\
+        --thread 8
+
+    ### Check if Fastp completed successfully
+    if [ \$? -ne 0 ]; then
+        echo "Error: Fastp failed for sample ${sample_name}"
+        exit 1
+    fi
+    """
+}
+
+### Process: Alignment with BWA-MEM
+process process_bwa {
+    tag { sample_name }
+
+    input:
+    tuple val(sample_name), path(clean_read1), path(clean_read2), path(report)
+
+    output:
+    tuple val(sample_name), path("${sample_name}.sam")
+
+    ### Align cleaned reads to the reference genome using BWA-MEM
+    script:
+    """
+    bwa mem -t 8 -R "@RG\\tID:${sample_name}\\tSM:${sample_name}\\tPL:ILLUMINA" \\
+        ${params.reference_genome} \\
+        ${clean_read1} ${clean_read2} > ${sample_name}.sam
+
+    ### Check if BWA-MEM completed successfully
+    if [ \$? -ne 0 ]; then
+        echo "Error: BWA-MEM failed for sample ${sample_name}"
+        exit 1
+    fi
+    """
+}
+
+### Process: Post-Alignment Processing
+process process_post_alignment {
+    tag { sample_name }
+
+    input:
+    tuple val(sample_name), path(sam_file)
+
+    output:
+    tuple val(sample_name), path("${sample_name}_sorted.bam")
+
+    ### Convert SAM to BAM, sort, and mark duplicates
+    script:
+    """
+    ### Convert SAM to BAM and sort
+    samtools view -@ 8 -bS ${sam_file} | samtools sort -@ 8 -o ${sample_name}_sorted.bam
+
+    ### Mark duplicates using Picard Tools
+    java -jar /usr/picard/picard.jar MarkDuplicates \\
+        I=${sample_name}_sorted.bam \\
+        O=${sample_name}_dedup.bam \\
+        M=${sample_name}_markduplicates_metrics.txt \\
+        CREATE_INDEX=true \\
+        VALIDATION_STRINGENCY=SILENT
+
+    ### Replace sorted BAM with deduplicated BAM
+    mv ${sample_name}_dedup.bam ${sample_name}_sorted.bam
+
+    ### Check if Picard MarkDuplicates completed successfully
+    if [ \$? -ne 0 ]; then
+        echo "Error: Picard MarkDuplicates failed for sample ${sample_name}"
+        exit 1
+    fi
+    """
+}
+
+### Process: Variant Calling with DeepVariant
+process process_deepvariant {
+    tag { sample_name }
+
+    input:
+    tuple val(sample_name), path(bam_file)
+
+    output:
+    tuple val(sample_name), path("${sample_name}_deepvariant.vcf.gz")
+
+    ### Call variants using DeepVariant
+    script:
+    """
+    mkdir -p dv_output
+
+    /opt/deepvariant/bin/run_deepvariant \\
+        --model_type=WGS \\
+        --ref=${params.reference_genome} \\
+        --reads=${bam_file} \\
+        --output_vcf=./dv_output/${sample_name}_deepvariant.vcf.gz \\
+        --num_shards=8
+
+    ### Move the output VCF to the current directory
+    mv dv_output/${sample_name}_deepvariant.vcf.gz ./
+    mv dv_output/${sample_name}_deepvariant.vcf.gz.tbi ./
+
+    ### Check if DeepVariant completed successfully
+    if [ \$? -ne 0 ]; then
+        echo "Error: DeepVariant failed for sample ${sample_name}"
+        exit 1
+    fi
+    """
+}
+
+### Process: Variant Filtering with bcftools
+process process_variant_filtering {
+    tag { sample_name }
+
+    input:
+    tuple val(sample_name), path(vcf_file)
+
+    output:
+    tuple val(sample_name), path("${sample_name}_filtered.vcf.gz")
+
+    ### Filter variants based on quality and depth
+    script:
+    """
+    bcftools filter -i 'QUAL>30 && DP>10' ${vcf_file} -Oz -o ${sample_name}_filtered.vcf.gz
+    tabix -p vcf ${sample_name}_filtered.vcf.gz
+
+    ### Check if variant filtering completed successfully
+    if [ \$? -ne 0 ]; then
+        echo "Error: Variant filtering failed for sample ${sample_name}"
+        exit 1
+    fi
+    """
+}
+
+### Process: Quality Control Reports and Visualization
+process process_qc_reports {
+    tag { sample_name }
+
+    input:
+    tuple val(sample_name), path(vcf_file)
+
+    output:
+    tuple val(sample_name), path("qc_reports/${sample_name}_variant_stats.txt"),
+    path("qc_reports/${sample_name}_qc_plots.pdf")
+
+    ### Generate QC reports and plots using bcftools and R
+    script:
+    """
+    mkdir -p qc_reports
+
+    ### Generate variant statistics
+    bcftools stats ${vcf_file} > qc_reports/${sample_name}_variant_stats.txt
+
+    ### Generate QC plots using R
+    Rscript -e "
+    library(ggplot2);
+    data <- read.table('qc_reports/${sample_name}_variant_stats.txt', header=TRUE);
+    p <- ggplot(data, aes(x=QUAL)) + geom_histogram(binwidth=1) + theme_minimal();
+    ggsave('qc_reports/${sample_name}_qc_plots.pdf', plot=p);
+    "
+
+    ### Check if QC reports were generated successfully
+    if [ \$? -ne 0 ]; then
+        echo "Error: QC report generation failed for sample ${sample_name}"
+        exit 1
+    fi
+    """
+}
+
+### Optional Process: Structural Variant Calling with Manta
+process process_manta {
+    tag { sample_name }
+
+    input:
+    tuple val(sample_name), path(bam_file)
+
+    output:
+    tuple val(sample_name), path("manta/${sample_name}_manta.vcf.gz")
+
+    ### Detect structural variants using Manta
+    script:
+    """
+    configManta.py \\
+        --bam ${bam_file} \\
+        --referenceFasta ${params.reference_genome} \\
+        --runDir manta_run_${sample_name}
+
+    manta_run_${sample_name}/runWorkflow.py -m local -j 8
+
+    ### Move the output VCF to the manta directory
+    mv manta_run_${sample_name}/results/variants/diploidSV.vcf.gz manta/${sample_name}_manta.vcf.gz
+    mv manta_run_${sample_name}/results/variants/diploidSV.vcf.gz.tbi manta/${sample_name}_manta.vcf.gz.tbi
+
+    ### Check if Manta completed successfully
+    if [ \$? -ne 0 ]; then
+        echo "Error: Manta failed for sample ${sample_name}"
+        exit 1
+    fi
+    """
+}
+
+### Optional Process: Copy Number Variation Analysis with CNVkit
+process process_cnvkit {
+    tag { sample_name }
+
+    input:
+    tuple val(sample_name), path(bam_file)
+
+    output:
+    tuple val(sample_name), path("cnvkit/${sample_name}_cnv.cns")
+
+    ### Analyze copy number variations using CNVkit
+    script:
+    """
+    cnvkit.py batch ${bam_file} \\
+        --fasta ${params.reference_genome} \\
+        --output-reference cnvkit_reference.cnn \\
+        --output-dir cnvkit_output_${sample_name} \\
+        --threads 8
+
+    ### Move the output CNV file to the cnvkit directory
+    mv cnvkit_output_${sample_name}/${sample_name}.cns cnvkit/${sample_name}_cnv.cns
+
+    ### Check if CNVkit completed successfully
+    if [ \$? -ne 0 ]; then
+        echo "Error: CNVkit failed for sample ${sample_name}"
+        exit 1
+    fi
+    """
+}
